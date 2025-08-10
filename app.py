@@ -1,16 +1,8 @@
-# app.py — Vertical Health: Full Analysis & One-Click Report (robust for Sheet13 CSV)
-# -----------------------------------------------------------------------------------
-# Works with a CSV composed of 6 stacked metric blocks:
-# 1) AVERAGE of Course completion %
-# 2) AVERAGE of NPS
-# 3) SUM of No of Placements(Monthly)
-# 4) AVERAGE of Reg to Placement %
-# 5) AVERAGE of Active Student %
-# 6) AVERAGE of Avg Mentor Rating
-#
-# Each block's header row:
-#   | Metric Name | Coding & Development | Commerce | Digital Marketing | Hospital Administration | Teaching Skilling | Technical Skilling |
-# followed by period rows in the first column and values in the rest.
+# app.py — Vertical Health: Full Analysis & Report (position-agnostic parser, mentor rating fix)
+# ----------------------------------------------------------------------------------------------
+# Works with a CSV having 6 stacked metric blocks (Sheet13 style) where the metric header row
+# may appear in ANY column. The vertical names must be to the RIGHT of the metric header cell,
+# and period values are in the SAME column as that metric header cell for the data rows below.
 
 import io
 import re
@@ -22,7 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ---- Optional PDF export (the app still works without it) ----
+# Optional PDF export; the app works without this dependency.
 REPORTLAB = True
 try:
     from reportlab.lib.pagesizes import A4, landscape
@@ -63,14 +55,14 @@ DEFAULT_THRESHOLDS = {
     "SUM of No of Placements(Monthly)": (10.0, 20.0),
     "AVERAGE of Reg to Placement %":    (40.0, 60.0),
     "AVERAGE of Active Student %":      (50.0, 70.0),
-    "AVERAGE of Avg Mentor Rating":     (4.0, 4.5),  # 1–5 scale
+    "AVERAGE of Avg Mentor Rating":     (4.0, 4.5),  # assumes 1–5
 }
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def to_number(s: object) -> float:
-    """Extract first numeric token (handles '4.6/5', '4,6', '55 %', '4 out of 5')."""
+    """Extract the first numeric token; handles '4.6/5', '4,6', '55 %', '4 out of 5' etc."""
     if pd.isna(s):
         return np.nan
     s = str(s).strip().replace(",", ".").replace("%", "")
@@ -81,7 +73,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
     """Map messy header text to the 6 canonical names (tolerates case/space/punctuation)."""
     if raw_text is None:
         return ""
-    t = str(raw_text).replace("\xa0", " ").strip()
+    t = str(raw_text).replace("\xa0", " ").strip()     # NBSP -> space
     t = re.sub(r"\s+", " ", t)
     low = t.lower().replace("‐","-").replace("–","-").replace("—","-")
     key_map = {
@@ -94,6 +86,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
     }
     if low in key_map:
         return key_map[low]
+    # fuzzy fallback
     try:
         from difflib import get_close_matches
         match = get_close_matches(low, list(key_map.keys()), n=1, cutoff=0.85)
@@ -101,7 +94,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
             return key_map[match[0]]
     except Exception:
         pass
-    return t
+    return t  # return trimmed original if unknown; we will still show it
 
 def looks_like_metric_header(cell: object) -> bool:
     if cell is None or (isinstance(cell, float) and pd.isna(cell)):
@@ -109,6 +102,7 @@ def looks_like_metric_header(cell: object) -> bool:
     return canonicalize_metric_name(cell) in METRICS
 
 def best_period_key(series: pd.Series):
+    """Sortable key for periods: real dates, 'Jan25', or fallback numeric."""
     s = series.astype(str).str.strip()
     parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
     if parsed.notna().any():
@@ -116,7 +110,7 @@ def best_period_key(series: pd.Series):
     mmmYY = pd.to_datetime(s, format="%b%y", errors="coerce")  # Jan25 style
     if mmmYY.notna().any():
         return mmmYY
-    return pd.to_numeric(s.str.extract(r"(\d+)")[0], errors="coerce")  # fallback
+    return pd.to_numeric(s.str.extract(r"(\d+)")[0], errors="coerce")
 
 def zone_of(value: float, red_max: float, watch_max: float) -> str:
     if pd.isna(value): return "—"
@@ -164,7 +158,7 @@ def trend_figure(metric: str, tidy_df: pd.DataFrame, vertical_order: list):
 with st.sidebar:
     st.header("1) Upload CSV")
     up = st.file_uploader("Upload the multi-table CSV", type=["csv"])
-    st.caption("Sheet13-style CSV with 6 stacked metric blocks; each block's header row lists vertical names.")
+    st.caption("Sheet13-style CSV with 6 stacked metric blocks; metric header can be in ANY column.")
 
     st.header("2) Thresholds (Zones)")
     thresholds = {}
@@ -183,59 +177,84 @@ if up is None:
     st.stop()
 
 # -----------------------------
-# Parse the CSV into tidy long
+# Parse CSV into tidy long (position-agnostic)
 # -----------------------------
 raw = pd.read_csv(up, header=None)
 raw = raw.dropna(how="all").reset_index(drop=True)
+n_rows, n_cols = raw.shape
 
-# Trim stray empty columns beyond plausible width
-if raw.shape[1] > len(PREFERRED_VERTICALS) + 1:
-    raw = raw.iloc[:, : (len(PREFERRED_VERTICALS) + 1)]
+def row_canonical_metric(row_vals: list) -> tuple[int, str] | tuple[None, None]:
+    """If any cell in a row matches a metric header, return (col_index, canonical_name)."""
+    for ci, cell in enumerate(row_vals):
+        if pd.isna(cell): 
+            continue
+        name = canonicalize_metric_name(cell)
+        if name in METRICS:
+            return ci, name
+    return None, None
 
 tidy_parts = []
-i = 0
 detected_verticals_union = set()
+r = 0
 
-while i < len(raw):
-    head = raw.iat[i, 0]
-    if looks_like_metric_header(head):
-        metric = canonicalize_metric_name(head)
+while r < n_rows:
+    row_vals = raw.iloc[r].fillna("").astype(str).str.strip().tolist()
+    start_col, metric = row_canonical_metric(row_vals)
+    if metric is None:
+        r += 1
+        continue
 
-        header_row = raw.iloc[i].fillna("").astype(str).str.strip().tolist()
-        block_verticals = [v for v in header_row[1:] if v != ""]
-        detected_verticals_union.update(block_verticals)
+    # Vertical names are to the RIGHT of the metric header cell
+    header_cells = raw.iloc[r, start_col+1 : n_cols].fillna("").astype(str).str.strip().tolist()
+    header_verticals = [v for v in header_cells if v != ""]
+    detected_verticals_union.update(header_verticals)
 
-        j = i + 1
-        while j < len(raw) and not looks_like_metric_header(raw.iat[j, 0]):
-            j += 1
+    # Find next header (or EOF)
+    r2 = r + 1
+    while r2 < n_rows:
+        nxt_vals = raw.iloc[r2].fillna("").astype(str).str.strip().tolist()
+        cidx, mname = row_canonical_metric(nxt_vals)
+        if mname is not None:
+            break
+        r2 += 1
 
-        block = raw.iloc[i+1:j].copy()
-        if not block.empty:
-            block = block.rename(columns={block.columns[0]: "Period"})
-            for k in range(1, min(len(block_verticals) + 1, block.shape[1])):
-                block = block.rename(columns={block.columns[k]: block_verticals[k-1]})
+    # Data block: rows r+1..r2-1, Period in column start_col; values to the right
+    if r2 - (r + 1) > 0 and len(header_verticals) > 0:
+        # Slice only the columns we need: [start_col .. start_col+len(header_verticals)]
+        right_bound = min(n_cols, start_col + 1 + len(header_verticals))
+        block = raw.iloc[r+1:r2, start_col:right_bound].copy()
 
-            keep = ["Period"] + [c for c in block.columns if c != "Period"]
-            block = block[keep]
+        # Rename columns: first is Period, rest are the header_verticals (truncate if needed)
+        col_map = {block.columns[0]: "Period"}
+        for j, vname in enumerate(header_verticals, start=1):
+            if j < block.shape[1]:
+                col_map[block.columns[j]] = vname
+        block = block.rename(columns=col_map)
 
-            long = block.melt(id_vars=["Period"], var_name="Vertical", value_name="Value")
-            long["Metric"] = metric
-            long["Value"] = long["Value"].apply(to_number)
-            long["Period"] = long["Period"].astype(str).str.strip()
-            long["Vertical"] = long["Vertical"].astype(str).str.strip()
-            long = long.dropna(subset=["Period", "Vertical"])
-            tidy_parts.append(long)
-        i = j
-    else:
-        i += 1
+        keep_cols = ["Period"] + [c for c in block.columns if c != "Period"]
+        block = block[keep_cols]
+
+        # Melt to tidy
+        long = block.melt(id_vars=["Period"], var_name="Vertical", value_name="Value")
+        long["Metric"] = metric
+        long["Value"] = long["Value"].apply(to_number)
+        long["Period"] = long["Period"].astype(str).str.strip()
+        long["Vertical"] = long["Vertical"].astype(str).str.strip()
+        long = long.dropna(subset=["Period", "Vertical"])
+        tidy_parts.append(long)
+
+    # Advance to next header row
+    r = r2
 
 if not tidy_parts:
-    st.error("No metric blocks detected. Please verify the CSV structure.")
+    st.error("No metric blocks detected. Ensure each metric header appears once in a row and its vertical names are to the RIGHT.")
+    with st.expander("Debug: CSV peek"):
+        st.dataframe(raw.head(20))
     st.stop()
 
 tidy = pd.concat(tidy_parts, ignore_index=True)
 
-# Determine final vertical order
+# Determine vertical order (preferred first, then extras)
 verticals = [v for v in PREFERRED_VERTICALS if v in detected_verticals_union] + \
             [v for v in detected_verticals_union if v not in PREFERRED_VERTICALS]
 
@@ -251,11 +270,12 @@ for m in METRICS:
 # Sort periods robustly
 wide["_period_sort"] = best_period_key(wide["Period"])
 wide["_row_order"] = np.arange(len(wide))
-wide = wide.sort_values(by=["_period_sort", "_row_order"]) if wide["_period_sort"].notna().any() else wide.sort_values(by="_row_order")
+wide = wide.sort_values(by=["_period_sort", "_row_order"]) if wide["_period_sort"].notna().any() \
+       else wide.sort_values(by="_row_order")
 
 periods_sorted = wide["Period"].dropna().astype(str).drop_duplicates().tolist()
 if not periods_sorted:
-    st.error("No period labels detected. Ensure each block's first column lists periods (e.g., Jan25).")
+    st.error("No period labels detected. Ensure each block's first data column contains periods (e.g., Jan25).")
     st.stop()
 
 latest_period = periods_sorted[-1]
@@ -274,7 +294,8 @@ for m in METRICS:
 
 for v in verticals:
     cur = wide[(wide["Vertical"] == v) & (wide["Period"] == latest_period)]
-    if cur.empty: continue
+    if cur.empty: 
+        continue
     cur = cur.iloc[0]
     prev = None
     if prev_period is not None:
@@ -296,10 +317,10 @@ for v in verticals:
 
         mn, mx = mins[m], maxs[m]
         if pd.isna(cur_val) or pd.isna(mn) or pd.isna(mx) or mx == mn:
-            ns = 0.5
+            ns = 0.5  # neutral
         else:
             ns = (cur_val - mn) / (mx - mn)
-            ns = np.clip(ns, 0, 1)
+            ns = float(np.clip(ns, 0, 1))
         norm_scores.append(ns)
 
     strength_pct = round(np.mean([x for x in norm_scores if pd.notna(x)]) * 100.0, 1) if norm_scores else np.nan
@@ -308,10 +329,10 @@ for v in verticals:
 
 summary_df = pd.DataFrame(summary_rows)
 
-# Guard for empty summary (prevents later KeyErrors)
+# Guard for empty summary
 if summary_df.empty:
     st.error("No data available for the latest period. Check that blocks & periods were parsed.")
-    with st.expander("Debug: what got parsed?"):
+    with st.expander("Debug: what got parsed?", expanded=False):
         try:
             st.write("Metrics:", sorted(tidy["Metric"].dropna().astype(str).str.strip().unique().tolist()))
             st.write("Periods:", sorted(tidy["Period"].dropna().astype(str).str.strip().unique().tolist()))
@@ -320,7 +341,7 @@ if summary_df.empty:
             pass
     st.stop()
 
-# Ensure expected columns exist (belt & suspenders)
+# Ensure expected columns exist (prevents KeyErrors during formatting)
 for base in ["Vertical", "Period"]:
     if base not in summary_df.columns:
         summary_df[base] = np.nan
@@ -333,16 +354,17 @@ if "Performance Strength %" not in summary_df.columns:
     summary_df["Performance Strength %"] = np.nan
 
 # Pretty table for UI/report
+def _fmt_delta(x, metric):
+    if pd.isna(x): return "—"
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}" + ("%" if "%" in metric else "")
+
 pretty = summary_df.copy()
 for m in METRICS:
     pretty[f"{m} (Current)"] = pretty[f"{m} (Current)"].apply(lambda v: fmt_value(m, v))
-    def _fmt_delta(x, metric=m):
-        if pd.isna(x): return "—"
-        sign = "+" if x >= 0 else ""
-        return f"{sign}{x:.2f}" + ("%" if "%" in metric else "")
-    pretty[f"{m} (Δ)"] = pretty[f"{m} (Δ)"].apply(_fmt_delta)
+    pretty[f"{m} (Δ)"] = pretty[f"{m} (Δ)"].apply(lambda x, metric=m: _fmt_delta(x, metric))
 
-# Safe ranking
+# Ranking (safe)
 if {"Vertical", "Performance Strength %"} <= set(summary_df.columns):
     rank = (
         summary_df[["Vertical", "Performance Strength %"]]
@@ -364,15 +386,14 @@ if not rank.empty:
 else:
     st.info("No Performance Strength data to rank.")
 
-if st.sidebar.checkbox("Show Performance Strength bar chart", value=True):
-    if not rank.empty:
-        fig, ax = plt.subplots()
-        ax.bar(rank["Vertical"], rank["Performance Strength %"])
-        ax.set_ylabel("Performance Strength %")
-        ax.set_title(f"Composite Performance Strength — {latest_period}")
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
-        plt.xticks(rotation=20)
-        st.pyplot(fig, use_container_width=True)
+if show_strength_bar and not rank.empty:
+    fig, ax = plt.subplots()
+    ax.bar(rank["Vertical"], rank["Performance Strength %"])
+    ax.set_ylabel("Performance Strength %")
+    ax.set_title(f"Composite Performance Strength — {latest_period}")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
+    plt.xticks(rotation=20)
+    st.pyplot(fig, use_container_width=True)
 
 st.divider()
 
@@ -387,16 +408,16 @@ else:
 st.divider()
 
 st.subheader("Per-Vertical Drilldown")
-pick = st.multiselect("Choose vertical(s)", verticals)
-if pick:
-    for v in pick:
+chosen = st.multiselect("Choose vertical(s)", verticals)
+if chosen:
+    subw = wide.copy()
+    subw = subw.sort_values(by=["_period_sort", "_row_order"])
+    for v in chosen:
         st.markdown(f"### {v}")
-        sub = wide[wide["Vertical"] == v].copy()
-        sub = sub.sort_values(by=["_period_sort", "_row_order"])
-        st.dataframe(sub[["Period"] + METRICS], use_container_width=True)
+        st.dataframe(subw[subw["Vertical"] == v][["Period"] + METRICS], use_container_width=True)
 
 # -----------------------------
-# Build consolidated HTML / PDF report
+# Report builders (HTML / PDF)
 # -----------------------------
 def build_html_report(title, latest_period, pretty_summary, ranking, tidy_df):
     css = """
@@ -429,9 +450,11 @@ def build_html_report(title, latest_period, pretty_summary, ranking, tidy_df):
         parts.append("<h2>Performance Strength — Ranking</h2>")
         parts.append(ranking.to_html(index=False, border=0, classes='tbl'))
 
+    # Trends
     for m in METRICS:
         fig = trend_figure(m, tidy_df, verticals)
-        if fig is None: continue
+        if fig is None: 
+            continue
         png = fig_to_png(fig)
         b64 = base64.b64encode(png).decode("utf-8")
         parts.append(f"<div class='section'><h2>{m} — Trend</h2>"
@@ -468,7 +491,8 @@ def build_pdf_report(title, latest_period, pretty_summary, ranking, tidy_df):
         story += [rtab, Spacer(1, 12)]
     for m in METRICS:
         fig = trend_figure(m, tidy_df, verticals)
-        if fig is None: continue
+        if fig is None: 
+            continue
         png = fig_to_png(fig)
         story.append(Paragraph(f"<b>{m} — Trend</b>", styles["Heading2"]))
         story.append(Image(ImageReader(io.BytesIO(png)), width=720, height=360))
