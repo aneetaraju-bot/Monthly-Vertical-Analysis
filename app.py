@@ -1,7 +1,7 @@
 # app.py
 # ------------------------------------------------
 # Streamlit Vertical Analysis & Zones
-# - Upload CSV/Excel (or use built‑in demo)
+# - Upload CSV/Excel (or use built‑in/bundled demo)
 # - Map columns: Vertical, Period, Metrics (multi‑select)
 # - Set Red/Watch/Healthy thresholds per metric
 # - Summary table (latest period + Δ vs previous + Zone)
@@ -9,13 +9,18 @@
 # - Per‑vertical drilldown (table + mini trend)
 # - Export insights as CSV
 #
-# Notes:
-# - Charts use matplotlib only (no seaborn, no custom colors, one chart per figure).
+# Requirements (requirements.txt):
+# streamlit>=1.33
+# pandas>=2.2
+# numpy>=1.26
+# matplotlib>=3.8
+# openpyxl>=3.1
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+from pathlib import Path
 
 st.set_page_config(page_title="Vertical Analysis & Zone Report", layout="wide")
 st.title("📊 Vertical Analysis & Zone Report")
@@ -30,11 +35,32 @@ st.markdown(
 # -----------------------------
 @st.cache_data
 def load_csv_or_excel(file) -> pd.DataFrame:
+    """Try CSV first, then Excel."""
     try:
         return pd.read_csv(file)
     except Exception:
-        file.seek(0)
+        try:
+            file.seek(0)
+        except Exception:
+            pass
         return pd.read_excel(file)
+
+def load_demo_df() -> pd.DataFrame:
+    """Prefer bundled data/sample.csv if present; else use tiny inline demo."""
+    sample_path = Path(__file__).parent / "data" / "sample.csv"
+    if sample_path.exists():
+        try:
+            return pd.read_csv(sample_path)
+        except Exception:
+            pass
+    # inline fallback
+    return pd.DataFrame({
+        "Vertical": ["Coding","Coding","Coding","Commerce","Commerce","Technical","Technical"],
+        "Period":   ["2025-06-01","2025-07-01","2025-08-01","2025-07-01","2025-08-01","2025-07-01","2025-08-01"],
+        "Completion %": [45.0, 52.0, 59.0, 38.0, 42.0, 47.0, 43.0],
+        "Engagement %": [62.0, 65.0, 61.0, 58.0, 60.0, 63.0, 64.0],
+        "Registrations": [120, 130, 140, 90, 110, 100, 95],
+    })
 
 def coerce_numeric(series: pd.Series):
     """Convert a column to numeric, stripping % and commas if needed."""
@@ -52,15 +78,12 @@ def sort_period_key(col: pd.Series):
     """
     Return a sortable key for a period column:
     - Try real dates
-    - Else extract trailing/in-string numbers (e.g., 'Week 12' -> 12)
-    - Else return NaNs (keeps original order)
+    - Else extract numeric token (e.g., 'Week 12' -> 12)
+    - Else NaNs (keeps original order fallback)
     """
-    # Try date parsing
     parsed = pd.to_datetime(col, errors='coerce')
     if parsed.notna().any():
         return parsed
-
-    # Fallback: extract a number
     idx = col.astype(str).str.extract(r'(\d+)')
     key = pd.to_numeric(idx[0], errors='coerce')
     return key
@@ -93,17 +116,9 @@ with st.sidebar:
 
     if uploaded is not None:
         df = load_csv_or_excel(uploaded)
-        using_demo = False
+        st.success("File uploaded.")
     else:
-        # Small embedded demo so the app always loads
-        df = pd.DataFrame({
-            "Vertical": ["Coding","Coding","Coding","Commerce","Commerce","Technical","Technical"],
-            "Period":   ["2025-06-01","2025-07-01","2025-08-01","2025-07-01","2025-08-01","2025-07-01","2025-08-01"],
-            "Completion %": [45.0, 52.0, 59.0, 38.0, 42.0, 47.0, 43.0],
-            "Engagement %": [62.0, 65.0, 61.0, 58.0, 60.0, 63.0, 64.0],
-            "Registrations": [120, 130, 140, 90, 110, 100, 95],
-        })
-        using_demo = True
+        df = load_demo_df()
         st.info("No file uploaded — showing demo data. Upload your CSV/Excel to analyze your data.")
 
     st.caption(f"Rows loaded: **{len(df)}**")
@@ -154,8 +169,9 @@ if not metrics:
 # Clean & type
 # -----------------------------
 data = df.copy()
-# Ensure we don't lose the original order for non-parsable periods
-data["_period_order"] = np.arange(len(data))
+
+# Preserve input order as secondary sort (useful if period parsing fails)
+data["_row_order"] = np.arange(len(data))
 data["_period_sort"] = sort_period_key(data[col_period])
 
 # Coerce metrics numeric
@@ -179,14 +195,13 @@ if data["_period_sort"].notna().any():
     latest_key = data["_period_sort"].max()
     latest_period_rows = data[data["_period_sort"] == latest_key]
 else:
-    # fallback: last occurrence per vertical by original order
-    latest_period_rows = data.sort_values(by="_period_order").groupby(col_vertical, as_index=False).tail(1)
+    latest_period_rows = data.sort_values(by="_row_order").groupby(col_vertical, as_index=False).tail(1)
 
 # For Δ, get the previous row per vertical by the sort key (or by order fallback)
 data_sorted = (
-    data.sort_values(by=["_period_sort", "_period_order"])
+    data.sort_values(by=["_period_sort", "_row_order"])
     if data["_period_sort"].notna().any()
-    else data.sort_values(by="_period_order")
+    else data.sort_values(by="_row_order")
 )
 prev_rows = data_sorted.groupby(col_vertical).nth(-2).reset_index()
 
@@ -256,7 +271,7 @@ if selected_verticals:
     for v in selected_verticals:
         st.markdown(f"### {v}")
         dfv = data[data[col_vertical].astype(str) == v].copy()
-        dfv = dfv.sort_values(by=["_period_sort", "_period_order"])
+        dfv = dfv.sort_values(by=["_period_sort", "_row_order"])
         st.dataframe(dfv[[col_period] + metrics], use_container_width=True)
 
         # Latest snapshot bullets
