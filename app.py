@@ -1,12 +1,14 @@
 # app.py
 # ------------------------------------------------
 # Streamlit Vertical Analysis & Zones
-# - Upload CSV/Excel (or use built‑in/bundled demo)
-# - Map columns: Vertical, Period, Metrics (multi‑select)
+# - Upload CSV/Excel (or use bundled/inline demo)
+# - Auto-detects "Monthly business Review - Sheet13.csv" wide layout and reshapes to:
+#       Period | Vertical | Completion %
+# - Map columns: Vertical, Period, Metrics (multi-select)
 # - Set Red/Watch/Healthy thresholds per metric
-# - Summary table (latest period + Δ vs previous + Zone)
-# - Trend charts (one figure per metric, lines by vertical)
-# - Per‑vertical drilldown (table + mini trend)
+# - Summary (latest period + Δ vs previous + Zone)
+# - Trends (one figure per metric; lines by vertical)
+# - Per-vertical drilldown (table + mini trend)
 # - Export insights as CSV
 #
 # Requirements (requirements.txt):
@@ -26,8 +28,8 @@ st.set_page_config(page_title="Vertical Analysis & Zone Report", layout="wide")
 st.title("📊 Vertical Analysis & Zone Report")
 
 st.markdown(
-    "Upload your CSV/Excel and map the columns. Then set thresholds to tag each vertical into "
-    "**🔴 Red / 🟡 Watch / ✅ Healthy** based on the latest period values."
+    "Upload your CSV/Excel and map the columns. Set thresholds to tag each vertical into "
+    "**🔴 Red / 🟡 Watch / ✅ Healthy** based on latest period values."
 )
 
 # -----------------------------
@@ -61,6 +63,71 @@ def load_demo_df() -> pd.DataFrame:
         "Engagement %": [62.0, 65.0, 61.0, 58.0, 60.0, 63.0, 64.0],
         "Registrations": [120, 130, 140, 90, 110, 100, 95],
     })
+
+def sanitize_columns(df: pd.DataFrame):
+    """Flatten MultiIndex headers and deduplicate column names; strip whitespace."""
+    # 1) Flatten MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        flat = []
+        for tpl in df.columns:
+            parts = [str(x) for x in tpl if pd.notna(x) and str(x).strip() != ""]
+            flat.append(" ".join(parts).strip())
+        df.columns = flat
+    # 2) Strip & force to string
+    cols = [str(c).strip() for c in df.columns]
+    # 3) Deduplicate
+    new_cols, seen, renamed = [], {}, []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            new_name = f"{c}_{seen[c]}"
+            renamed.append((c, new_name))
+            new_cols.append(new_name)
+        else:
+            seen[c] = 0
+            new_cols.append(c)
+    df.columns = new_cols
+    return df, renamed
+
+def reshape_mbr_sheet13(df: pd.DataFrame):
+    """
+    Detect and reshape the 'Monthly business Review - Sheet13.csv' style:
+    - Header row label like 'AVERAGE of Course completion % ' in col0.
+    - Row 0 contains real headers: 'Helper Date', 'Coding & Development', 'Commerce', etc.
+    Returns tidy df with columns: Period, Vertical, Completion %
+    """
+    first_header = str(df.columns[0]).strip().lower()
+    if first_header.startswith("average of course completion"):
+        # Row 0 has the real headers
+        new_cols = df.iloc[0].astype(str).str.strip().tolist()
+        df2 = df.iloc[1:].copy()
+        df2.columns = new_cols
+
+        # Normalize period column
+        if "Helper Date" in df2.columns:
+            df2 = df2.rename(columns={"Helper Date": "Period"})
+        else:
+            df2 = df2.rename(columns={df2.columns[0]: "Period"})
+
+        id_col = "Period"
+        value_cols = [c for c in df2.columns if c != id_col]
+        tidy = df2.melt(id_vars=[id_col], value_vars=value_cols,
+                        var_name="Vertical", value_name="Completion %")
+
+        # Clean values
+        tidy["Completion %"] = (
+            tidy["Completion %"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        tidy["Completion %"] = pd.to_numeric(tidy["Completion %"], errors="coerce")
+        tidy["Period"] = tidy["Period"].astype(str).str.strip()
+        tidy["Vertical"] = tidy["Vertical"].astype(str).str.strip()
+        tidy = tidy.dropna(subset=["Period", "Vertical"]).reset_index(drop=True)
+        return tidy
+    return None  # Not that format
 
 def coerce_numeric(series: pd.Series):
     """Convert a column to numeric, stripping % and commas if needed."""
@@ -115,11 +182,22 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
     if uploaded is not None:
-        df = load_csv_or_excel(uploaded)
+        raw = load_csv_or_excel(uploaded)
+        raw, renamed_cols = sanitize_columns(raw)
+        reshaped = reshape_mbr_sheet13(raw)
+        df = reshaped if reshaped is not None else raw
         st.success("File uploaded.")
     else:
-        df = load_demo_df()
+        raw = load_demo_df()
+        raw, renamed_cols = sanitize_columns(raw)
+        df = raw
         st.info("No file uploaded — showing demo data. Upload your CSV/Excel to analyze your data.")
+
+    if renamed_cols:
+        st.warning(
+            "Duplicate/MultiIndex headers normalized: " +
+            ", ".join([f"{old} → {new}" for old, new in renamed_cols])
+        )
 
     st.caption(f"Rows loaded: **{len(df)}**")
     if st.checkbox("Preview data"):
@@ -131,15 +209,19 @@ with st.sidebar:
         st.error("No columns found in the data.")
         st.stop()
 
-    # Best-effort defaults
-    guess_vertical = "Vertical" if "Vertical" in cols else cols[0]
-    guess_period = "Period" if "Period" in cols else (cols[1] if len(cols) > 1 else cols[0])
+    # Auto-detect if we created a tidy Sheet13
+    auto_detected = set(["Period", "Vertical"]).issubset(set(cols))
+    completion_exists = "Completion %" in cols
 
-    col_vertical = st.selectbox("Vertical column", options=cols, index=cols.index(guess_vertical))
-    col_period   = st.selectbox("Date/Week/Period column", options=cols, index=cols.index(guess_period))
+    guess_vertical = "Vertical" if "Vertical" in cols else cols[0]
+    guess_period   = "Period" if "Period" in cols else (cols[1] if len(cols) > 1 else cols[0])
+
+    col_vertical = st.selectbox("Vertical column", options=cols, index=cols.index(guess_vertical) if guess_vertical in cols else 0)
+    col_period   = st.selectbox("Date/Week/Period column", options=cols, index=cols.index(guess_period) if guess_period in cols else 0)
 
     metric_candidates = [c for c in cols if c not in [col_vertical, col_period]]
-    default_metrics = metric_candidates[:3] if metric_candidates else []
+    default_metrics = (["Completion %"] if (auto_detected and completion_exists and "Completion %" in metric_candidates)
+                       else (metric_candidates[:3] if metric_candidates else []))
     metrics = st.multiselect("Metric columns (choose one or more)", options=metric_candidates, default=default_metrics)
 
     st.header("3) Thresholds & Tags")
@@ -234,10 +316,16 @@ st.subheader("Trends by Metric")
 
 for m in metrics:
     st.markdown(f"**{m}**")
+    # Keep only necessary columns and drop NA in keys
+    safe = data[[col_period, col_vertical, m]].dropna(subset=[col_period, col_vertical])
+    if safe.empty:
+        st.info(f"No valid rows for '{m}' after cleaning.")
+        continue
+
     fig, ax = plt.subplots()
 
     # pivot: rows = period, columns = vertical, values = metric
-    pvt = data.pivot_table(index=col_period, columns=col_vertical, values=m, aggfunc='mean')
+    pvt = safe.pivot_table(index=col_period, columns=col_vertical, values=m, aggfunc='mean')
 
     # sort rows by our parsed key; if all NaN, keep original row order
     order_key = sort_period_key(pvt.index.to_series())
