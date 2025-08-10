@@ -68,7 +68,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
     """Map messy header text to the 6 canonical metric names."""
     if raw_text is None:
         return ""
-    t = str(raw_text).replace("\xa0"," ").strip()
+    t = str(raw_text).replace("\xa0"," ").strip()  # NBSP -> space
     t = re.sub(r"\s+"," ", t)
     low = t.lower().replace("‐","-").replace("–","-").replace("—","-")
     key_map = {
@@ -81,6 +81,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
     }
     if low in key_map:
         return key_map[low]
+    # fuzzy fallback
     try:
         from difflib import get_close_matches
         match = get_close_matches(low, list(key_map.keys()), n=1, cutoff=0.85)
@@ -88,7 +89,7 @@ def canonicalize_metric_name(raw_text: object) -> str:
             return key_map[match[0]]
     except Exception:
         pass
-    return t
+    return t  # unknown but trimmed; app won’t crash
 
 def looks_like_metric_header(cell: object) -> bool:
     if cell is None or (isinstance(cell, float) and pd.isna(cell)):
@@ -264,7 +265,7 @@ while r < n_rows:
     r = r2
 
 if not tidy_parts:
-    st.error("No metric blocks detected. Ensure each metric header appears in a row and its vertical names are to the RIGHT (same row or next row).")
+    st.error("No metric blocks detected. Ensure each metric header is in a row and vertical names are to the RIGHT (same row or next row).")
     with st.expander("Debug: CSV peek"):
         st.dataframe(raw.head(40))
     st.stop()
@@ -329,4 +330,222 @@ for v in verticals:
 
         rec[f"{m} (Current)"] = cur_val
         rec[f"{m} (Δ)"] = delta
-        rec[f"{m} (Zone)"] =
+        rec[f"{m} (Zone)"] = z
+
+        mn, mx = mins[m], maxs[m]
+        if pd.isna(cur_val) or pd.isna(mn) or pd.isna(mx) or mx == mn:
+            ns = 0.5  # neutral
+        else:
+            ns = float(np.clip((cur_val - mn) / (mx - mn), 0, 1))
+        norm_scores.append(ns)
+
+    rec["Performance Strength %"] = round(np.mean([x for x in norm_scores if pd.notna(x)]) * 100.0, 1) if norm_scores else np.nan
+    summary_rows.append(rec)
+
+summary_df = pd.DataFrame(summary_rows)
+if summary_df.empty:
+    st.error("No data available for the latest period. Check that blocks & periods were parsed.")
+    with st.expander("Debug: what got parsed?", expanded=False):
+        st.write("Metrics:", sorted(tidy["Metric"].dropna().astype(str).str.strip().unique().tolist()))
+        st.write("Periods:", sorted(tidy["Period"].dropna().astype(str).str.strip().unique().tolist()))
+        st.write("Verticals:", sorted(tidy["Vertical"].dropna().astype(str).str.strip().unique().tolist()))
+    st.stop()
+
+# Ensure expected columns exist (prevents KeyErrors during formatting)
+for base in ["Vertical","Period"]:
+    if base not in summary_df.columns:
+        summary_df[base] = np.nan
+for m in METRICS:
+    for suf in [" (Current)"," (Δ)"," (Zone)"]:
+        col = f"{m}{suf}"
+        if col not in summary_df.columns:
+            summary_df[col] = np.nan
+if "Performance Strength %" not in summary_df.columns:
+    summary_df["Performance Strength %"] = np.nan
+
+# Pretty table for UI/report
+def _fmt_delta(x, metric):
+    if pd.isna(x): return "—"
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}" + ("%" if "%" in metric else "")
+
+pretty = summary_df.copy()
+for m in METRICS:
+    pretty[f"{m} (Current)"] = pretty[f"{m} (Current)"].apply(lambda v: fmt_value(m, v))
+    pretty[f"{m} (Δ)"] = pretty[f"{m} (Δ)"].apply(lambda x, metric=m: _fmt_delta(x, metric))
+
+# Ranking
+if {"Vertical", "Performance Strength %"} <= set(summary_df.columns):
+    rank = (
+        summary_df[["Vertical", "Performance Strength %"]]
+        .dropna(subset=["Performance Strength %"])
+        .sort_values("Performance Strength %", ascending=False)
+    )
+else:
+    rank = pd.DataFrame(columns=["Vertical", "Performance Strength %"])
+
+# -----------------------------
+# UI
+# -----------------------------
+st.subheader(f"Summary — Latest Period: {latest_period}")
+st.dataframe(pretty, use_container_width=True)
+
+if not rank.empty:
+    st.subheader("Performance Strength — Ranking")
+    st.dataframe(rank, use_container_width=True)
+else:
+    st.info("No Performance Strength data to rank.")
+
+if show_strength_bar and not rank.empty:
+    fig, ax = plt.subplots()
+    ax.bar(rank["Vertical"], rank["Performance Strength %"])
+    ax.set_ylabel("Performance Strength %")
+    ax.set_title(f"Composite Performance Strength — {latest_period}")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
+    plt.xticks(rotation=20)
+    st.pyplot(fig, use_container_width=True)
+
+st.divider()
+st.subheader("Trends by Metric")
+metric_choice = st.selectbox("Choose metric", METRICS, index=0)
+fig = trend_figure(metric_choice, tidy, verticals)
+if fig is not None:
+    st.pyplot(fig, use_container_width=True)
+else:
+    st.info("No data for that metric.")
+
+st.divider()
+st.subheader("Per-Vertical Drilldown")
+chosen = st.multiselect("Choose vertical(s)", verticals)
+if chosen:
+    subw = wide.sort_values(by=["_period_sort","_row_order"])
+    for v in chosen:
+        st.markdown(f"### {v}")
+        st.dataframe(subw[subw["Vertical"] == v][["Period"] + METRICS], use_container_width=True)
+
+# -----------------------------
+# Report builders (HTML/PDF)
+# -----------------------------
+def build_html_report(title, latest_period, pretty_summary, ranking, tidy_df):
+    css = """
+    <style>
+      body { font-family: Inter, Arial, sans-serif; margin: 24px; }
+      h1 { margin: 0 0 8px 0; }
+      .muted { color:#666; margin-bottom: 20px; }
+      table.tbl { border-collapse: collapse; width: 100%; margin: 12px 0 24px; }
+      table.tbl th, table.tbl td { border: 1px solid #ddd; padding: 8px; font-size: 13px; }
+      table.tbl th { background:#f7f7f7; text-align:left; }
+      .section { margin-top: 24px; }
+      .imgwrap { text-align:center; margin: 12px 0 24px; }
+      .kpi { margin: 8px 0; }
+    </style>
+    """
+    parts = [
+        css,
+        f"<h1>{title}</h1>",
+        f"<div class='muted'>Generated: {datetime.now():%Y-%m-%d %H:%M} • Latest period: <b>{latest_period}</b></div>",
+        "<h2>Executive Summary</h2>",
+    ]
+    zone_cols = [c for c in pretty_summary.columns if c.endswith("(Zone)")]
+    healthy = (pretty_summary[zone_cols] == "✅ Healthy").sum().sum()
+    watch = (pretty_summary[zone_cols] == "🟡 Watch").sum().sum()
+    red = (pretty_summary[zone_cols] == "🔴 Red").sum().sum()
+    parts.append(f"<div class='kpi'>✅ Healthy: <b>{healthy}</b> • 🟡 Watch: <b>{watch}</b> • 🔴 Red: <b>{red}</b></div>")
+    parts.append("<h2>Summary — Latest Period by Vertical</h2>")
+    parts.append(pretty_summary.to_html(index=False, border=0, classes='tbl'))
+    if not ranking.empty:
+        parts.append("<h2>Performance Strength — Ranking</h2>")
+        parts.append(ranking.to_html(index=False, border=0, classes='tbl'))
+
+    # Trends
+    for m in METRICS:
+        fig = trend_figure(m, tidy_df, verticals)
+        if fig is None:
+            continue
+        png = fig_to_png(fig)
+        b64 = base64.b64encode(png).decode("utf-8")
+        parts.append(f"<div class='section'><h2>{m} — Trend</h2>"
+                     f"<div class='imgwrap'><img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto'/></div></div>")
+    return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + "\n".join(parts) + "</body></html>"
+
+def build_pdf_report(title, latest_period, pretty_summary, ranking, tidy_df):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph(f"<b>{title}</b>", styles["Title"]),
+        Paragraph(f"Generated: {datetime.now():%Y-%m-%d %H:%M} • Latest period: <b>{latest_period}</b>", styles["Normal"]),
+        Spacer(1, 12),
+        Paragraph("<b>Summary — Latest Period by Vertical</b>", styles["Heading2"]),
+    ]
+    sdata = [pretty_summary.columns.tolist()] + pretty_summary.values.tolist()
+    stab = Table(sdata, repeatRows=1)
+    stab.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTSIZE", (0,0), (-1,-1), 7.5),
+    ]))
+    story += [stab, Spacer(1, 12)]
+    if not ranking.empty:
+        story.append(Paragraph("<b>Performance Strength — Ranking</b>", styles["Heading2"]))
+        rdata = [ranking.columns.tolist()] + ranking.values.tolist()
+        rtab = Table(rdata, repeatRows=1)
+        rtab.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+        ]))
+        story += [rtab, Spacer(1, 12)]
+    for m in METRICS:
+        fig = trend_figure(m, tidy_df, verticals)
+        if fig is None:
+            continue
+        png = fig_to_png(fig)
+        story.append(Paragraph(f"<b>{m} — Trend</b>", styles["Heading2"]))
+        story.append(Image(ImageReader(io.BytesIO(png)), width=720, height=360))
+        story.append(PageBreak())
+    doc.build(story)
+    pdf = buf.getvalue(); buf.close()
+    return pdf
+
+# -----------------------------
+# Downloads
+# -----------------------------
+st.subheader("📄 Download consolidated report")
+app_title = "Vertical Health — Full Analysis Report"
+html = build_html_report(app_title, latest_period, pretty, rank, tidy)
+st.download_button(
+    "Download HTML report",
+    data=html.encode("utf-8"),
+    file_name=f"vertical_full_report_{latest_period}.html",
+    mime="text/html"
+)
+
+if REPORTLAB:
+    try:
+        pdf = build_pdf_report(app_title, latest_period, pretty, rank, tidy)
+        st.download_button(
+            "Download PDF report",
+            data=pdf,
+            file_name=f"vertical_full_report_{latest_period}.pdf",
+            mime="application/pdf"
+        )
+    except Exception as e:
+        st.warning(f"PDF generation error: {e}. HTML export still available.")
+else:
+    st.info("PDF export requires `reportlab`. Add it to requirements.txt to enable.")
+
+# -----------------------------
+# Debug (optional — remove later)
+# -----------------------------
+with st.expander("🔎 Debug (hide in production)", expanded=False):
+    try:
+        parsed_metrics = sorted(tidy["Metric"].dropna().astype(str).str.strip().unique().tolist())
+        parsed_periods = sorted(tidy["Period"].dropna().astype(str).str.strip().unique().tolist())
+        parsed_verticals = sorted(tidy["Vertical"].dropna().astype(str).str.strip().unique().tolist())
+    except Exception:
+        parsed_metrics, parsed_periods, parsed_verticals = [], [], []
+    st.write("Parsed metric names:", parsed_metrics)
+    st.write("Parsed periods:", parsed_periods)
+    st.write("Detected verticals:", verticals)
+    st.write("Latest period:", latest_period, "Prev period:", prev_period)
