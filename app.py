@@ -1,6 +1,15 @@
-# app.py — Vertical Health: Full Analysis & Single-Click Report (Mentor Rating fix)
+# app.py — Vertical Health: Full Analysis & One-Click Report (Mentor Rating fixed)
+# --------------------------------------------------------------------------------
+# Requirements (requirements.txt):
+# streamlit
+# pandas
+# numpy
+# matplotlib
+# reportlab   # optional: only if you want the PDF export button to work
 
-import io, re, base64
+import io
+import re
+import base64
 from datetime import datetime
 
 import numpy as np
@@ -34,7 +43,7 @@ METRICS = [
     "AVERAGE of Avg Mentor Rating",
 ]
 
-# Canonical list (used only for preferred order; we still read actual header names per block)
+# Preferred vertical order (we’ll still take names from the CSV headers per block)
 PREFERRED_VERTICALS = [
     "Coding & Development",
     "Commerce",
@@ -51,7 +60,7 @@ DEFAULT_THRESHOLDS = {
     "SUM of No of Placements(Monthly)": (10.0, 20.0),
     "AVERAGE of Reg to Placement %":    (40.0, 60.0),
     "AVERAGE of Active Student %":      (50.0, 70.0),
-    "AVERAGE of Avg Mentor Rating":     (4.0, 4.5),   # assumes 1–5 scale
+    "AVERAGE of Avg Mentor Rating":     (4.0, 4.5),  # assumes 1–5 scale
 }
 
 ZONE_POINTS = {"🔴 Red": 0, "🟡 Watch": 1, "✅ Healthy": 2}
@@ -59,7 +68,7 @@ ZONE_POINTS = {"🔴 Red": 0, "🟡 Watch": 1, "✅ Healthy": 2}
 # -----------------------------
 # Helpers
 # -----------------------------
-def to_number(s):
+def to_number(s: object) -> float:
     """Extract first numeric token (handles '4.6/5', '4,6', '55 %', '4 out of 5')."""
     if pd.isna(s):
         return np.nan
@@ -67,41 +76,77 @@ def to_number(s):
     m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
     return float(m.group(0)) if m else np.nan
 
-def looks_like_metric_header(cell):
-    if pd.isna(cell): return False
-    t = str(cell).strip().lower()
-    return any(t.startswith(m.lower()) for m in METRICS)
+def canonicalize_metric_name(raw_text: object) -> str:
+    """Map messy header text to the 6 canonical metric names (tolerates case/space/punctuation)."""
+    if raw_text is None:
+        return ""
+    t = str(raw_text).replace("\xa0", " ").strip()   # replace NBSP
+    t = re.sub(r"\s+", " ", t)
+    low = t.lower().replace("‐","-").replace("–","-").replace("—","-")
+    key_map = {
+        "average of course completion %": "AVERAGE of Course completion %",
+        "average of nps": "AVERAGE of NPS",
+        "sum of no of placements(monthly)": "SUM of No of Placements(Monthly)",
+        "average of reg to placement %": "AVERAGE of Reg to Placement %",
+        "average of active student %": "AVERAGE of Active Student %",
+        "average of avg mentor rating": "AVERAGE of Avg Mentor Rating",
+    }
+    if low in key_map:
+        return key_map[low]
+    # fuzzy fallback (tiny typos)
+    try:
+        from difflib import get_close_matches
+        match = get_close_matches(low, list(key_map.keys()), n=1, cutoff=0.85)
+        if match:
+            return key_map[match[0]]
+    except Exception:
+        pass
+    return t  # return trimmed original if we can't resolve
 
-def zone_of(value, red_max, watch_max):
-    if pd.isna(value): return "—"
-    if value <= red_max: return "🔴 Red"
-    if value <= watch_max: return "🟡 Watch"
-    return "✅ Healthy"
+def looks_like_metric_header(cell: object) -> bool:
+    """True if the row starts a known metric block."""
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return False
+    return canonicalize_metric_name(cell) in METRICS
 
 def best_period_key(series: pd.Series):
+    """Return a sortable key for the Period column (dates, 'Jan25', 'Week 3', etc.)."""
     s = series.astype(str).str.strip()
     parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-    if parsed.notna().any(): return parsed
-    mmmYY = pd.to_datetime(s, format="%b%y", errors="coerce")
-    if mmmYY.notna().any(): return mmmYY
+    if parsed.notna().any():
+        return parsed
+    mmmYY = pd.to_datetime(s, format="%b%y", errors="coerce")  # Jan25 etc.
+    if mmmYY.notna().any():
+        return mmmYY
     nums = pd.to_numeric(s.str.extract(r"(\d+)")[0], errors="coerce")
-    return nums
+    return nums  # may be NaN; we'll fall back to row order
 
-def fmt_value(metric, v):
-    if pd.isna(v): return "—"
-    if "%" in metric: return f"{v:.2f}%"
-    return f"{v:.2f}"
+def zone_of(value: float, red_max: float, watch_max: float) -> str:
+    if pd.isna(value):
+        return "—"
+    if value <= red_max:
+        return "🔴 Red"
+    if value <= watch_max:
+        return "🟡 Watch"
+    return "✅ Healthy"
 
-def fig_to_png(fig):
+def fmt_value(metric: str, v: float) -> str:
+    if pd.isna(v):
+        return "—"
+    return f"{v:.2f}%" if "%" in metric else f"{v:.2f}"
+
+def fig_to_png(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
-    plt.close(fig); buf.seek(0)
+    plt.close(fig)
+    buf.seek(0)
     return buf.getvalue()
 
-def trend_figure(metric, tidy_df, vertical_order):
-    """Build a single-metric trend chart; **Mentor Rating fixed to 0–5 y-axis**."""
+def trend_figure(metric: str, tidy_df: pd.DataFrame, vertical_order: list):
+    """Build a single-metric trend chart; Mentor Rating locked to 0–5 y-axis."""
     mdf = tidy_df[tidy_df["Metric"] == metric].copy()
-    if mdf.empty: return None
+    if mdf.empty:
+        return None
     mdf["_period_sort"] = best_period_key(mdf["Period"])
     mdf["_row_order"] = np.arange(len(mdf))
     mdf = mdf.sort_values(by=["_period_sort", "_row_order"])
@@ -109,7 +154,8 @@ def trend_figure(metric, tidy_df, vertical_order):
     fig, ax = plt.subplots()
     for v in vertical_order:
         sub = mdf[mdf["Vertical"] == v]
-        if sub.empty: continue
+        if sub.empty:
+            continue
         ax.plot(sub["Period"].astype(str).values, sub["Value"].values, marker="o", label=v)
     ax.set_title(f"{metric} — Trend by Vertical")
     ax.set_xlabel("Period")
@@ -117,7 +163,7 @@ def trend_figure(metric, tidy_df, vertical_order):
     ax.legend(loc="best")
     ax.grid(True, linestyle="--", linewidth=0.5)
 
-    # ---- Mentor Rating fix: lock to 0–5 and tidy ticks ----
+    # Mentor Rating fix: lock to 0–5 and tidy ticks
     if "avg mentor rating" in metric.lower():
         ax.set_ylim(0, 5)
         try:
@@ -132,15 +178,15 @@ def trend_figure(metric, tidy_df, vertical_order):
 with st.sidebar:
     st.header("1) Upload CSV")
     up = st.file_uploader("Upload the multi-table CSV", type=["csv"])
-    st.caption("Sheet with 6 stacked metric blocks, each header row has vertical names.")
+    st.caption("CSV with 6 stacked metric blocks; each block's header row lists vertical names.")
 
     st.header("2) Thresholds (Zones)")
     thresholds = {}
     for m in METRICS:
         r_def, w_def = DEFAULT_THRESHOLDS[m]
         st.markdown(f"**{m}**")
-        red = st.number_input(f"Red max (≤) — {m}", value=float(r_def), key=f"{m}_r")
-        watch = st.number_input(f"Watch max (≤) — {m}", value=float(w_def), key=f"{m}_w")
+        red = st.number_input(f"Red max (≤) — {m}", value=float(r_def), key=f"{m}_red")
+        watch = st.number_input(f"Watch max (≤) — {m}", value=float(w_def), key=f"{m}_watch")
         thresholds[m] = (red, watch)
 
     st.header("3) Report options")
@@ -156,7 +202,7 @@ if up is None:
 raw = pd.read_csv(up, header=None)
 raw = raw.dropna(how="all").reset_index(drop=True)
 
-# If extra stray columns exist, trim to plausible width
+# Trim stray empty columns beyond plausible width
 if raw.shape[1] > len(PREFERRED_VERTICALS) + 1:
     raw = raw.iloc[:, : (len(PREFERRED_VERTICALS) + 1)]
 
@@ -167,11 +213,12 @@ detected_verticals_union = set()
 while i < len(raw):
     head = raw.iat[i, 0]
     if looks_like_metric_header(head):
-        metric = str(head).strip()
+        metric = canonicalize_metric_name(head)
         header_row = raw.iloc[i].fillna("").astype(str).str.strip().tolist()
         block_verticals = [v for v in header_row[1:] if v != ""]
         detected_verticals_union.update(block_verticals)
 
+        # rows until next metric header or EOF
         j = i + 1
         while j < len(raw) and not looks_like_metric_header(raw.iat[j, 0]):
             j += 1
@@ -179,14 +226,15 @@ while i < len(raw):
         block = raw.iloc[i+1:j].copy()
         if not block.empty:
             block = block.rename(columns={block.columns[0]: "Period"})
-            # rename remaining columns to names read from header row
+            # rename remaining columns using names from header row
             for k in range(1, min(len(block_verticals) + 1, block.shape[1])):
                 block = block.rename(columns={block.columns[k]: block_verticals[k-1]})
 
-            # keep Period + all present header verticals (don’t drop due to minor spelling differences)
+            # Keep exactly what this block header provided (avoid dropping due to tiny name differences)
             keep = ["Period"] + [c for c in block.columns if c != "Period"]
             block = block[keep]
 
+            # Melt to tidy
             long = block.melt(id_vars=["Period"], var_name="Vertical", value_name="Value")
             long["Metric"] = metric
             long["Value"] = long["Value"].apply(to_number)
@@ -204,7 +252,7 @@ if not tidy_parts:
 
 tidy = pd.concat(tidy_parts, ignore_index=True)
 
-# Determine final vertical order (canonical first, then any others)
+# Determine final vertical order (preferred first, then any extras)
 verticals = [v for v in PREFERRED_VERTICALS if v in detected_verticals_union] + \
             [v for v in detected_verticals_union if v not in PREFERRED_VERTICALS]
 
@@ -237,21 +285,20 @@ prev_period = periods_sorted[-2] if len(periods_sorted) >= 2 else None
 # Summary (current, Δ, zone) + Performance Strength
 # -----------------------------
 summary_rows = []
-latest_slice = wide[wide["Period"] == latest_period].copy()
 
-# Normalized scores for strength (within latest period)
-norm_maps = {}
+# Precompute mins/maxes in latest period for normalization
+latest_slice = wide[wide["Period"] == latest_period].copy()
+mins = {}
+maxs = {}
 for m in METRICS:
     s = latest_slice[m].astype(float)
     mn, mx = s.min(skipna=True), s.max(skipna=True)
-    if pd.isna(mn) or pd.isna(mx) or mx == mn:
-        norm_maps[m] = s.apply(lambda _: 0.5)  # no variation → neutral
-    else:
-        norm_maps[m] = (s - mn) / (mx - mn)
+    mins[m], maxs[m] = (mn, mx)
 
 for v in verticals:
     cur = wide[(wide["Vertical"] == v) & (wide["Period"] == latest_period)]
-    if cur.empty: continue
+    if cur.empty:
+        continue
     cur = cur.iloc[0]
     prev = None
     if prev_period is not None:
@@ -271,20 +318,29 @@ for v in verticals:
         rec[f"{m} (Δ)"] = delta
         rec[f"{m} (Zone)"] = z
 
-        # normalized score lookup aligned by vertical
-        try:
-            idx = latest_slice.index[latest_slice["Vertical"] == v][0]
-            ns = norm_maps[m].loc[idx]
-        except Exception:
-            ns = np.nan
+        # normalized score within latest period
+        mn, mx = mins[m], maxs[m]
+        if pd.isna(cur_val) or pd.isna(mn) or pd.isna(mx) or mx == mn:
+            ns = 0.5  # neutral if no variation / missing
+        else:
+            ns = (cur_val - mn) / (mx - mn)
+            ns = np.clip(ns, 0, 1)
         norm_scores.append(ns)
 
+    # Performance Strength
     valid = [x for x in norm_scores if pd.notna(x)]
     strength_pct = round(np.mean(valid) * 100.0, 1) if valid else np.nan
     rec["Performance Strength %"] = strength_pct
     summary_rows.append(rec)
 
 summary_df = pd.DataFrame(summary_rows)
+
+# Ensure the 3 columns exist for each metric (prevents KeyError during formatting)
+for m in METRICS:
+    for suffix in [" (Current)", " (Δ)", " (Zone)"]:
+        col = f"{m}{suffix}"
+        if col not in summary_df.columns:
+            summary_df[col] = np.nan
 
 # Pretty table for UI/report
 pretty = summary_df.copy()
@@ -377,7 +433,8 @@ def build_html_report(title, latest_period, pretty_summary, ranking, tidy_df):
     # Trends (embed images)
     for m in METRICS:
         fig = trend_figure(m, tidy_df, verticals)
-        if fig is None: continue
+        if fig is None: 
+            continue
         png = fig_to_png(fig)
         b64 = base64.b64encode(png).decode("utf-8")
         parts.append(f"<div class='section'><h2>{m} — Trend</h2>"
@@ -412,10 +469,11 @@ def build_pdf_report(title, latest_period, pretty_summary, ranking, tidy_df):
             ("FONTSIZE", (0,0), (-1,-1), 8),
         ]))
         story += [rtab, Spacer(1, 12)]
-    # Add metric trends (Mentor Rating will be 0–5 range)
+    # Metric trends (Mentor Rating locked 0–5)
     for m in METRICS:
         fig = trend_figure(m, tidy_df, verticals)
-        if fig is None: continue
+        if fig is None: 
+            continue
         png = fig_to_png(fig)
         story.append(Paragraph(f"<b>{m} — Trend</b>", styles["Heading2"]))
         story.append(Image(ImageReader(io.BytesIO(png)), width=720, height=360))
@@ -450,3 +508,15 @@ if REPORTLAB:
         st.warning(f"PDF generation error: {e}. HTML export still available.")
 else:
     st.info("PDF export requires `reportlab`. Add it to requirements.txt to enable.")
+
+# -----------------------------
+# Debug (optional — remove later)
+# -----------------------------
+with st.expander("🔎 Debug (hide in production)", expanded=False):
+    try:
+        parsed_metrics = sorted(tidy["Metric"].dropna().astype(str).str.strip().unique().tolist())
+    except Exception:
+        parsed_metrics = []
+    st.write("Parsed metric names:", parsed_metrics)
+    st.write("Detected verticals:", verticals)
+    st.write("Latest period:", latest_period, "Prev period:", prev_period)
