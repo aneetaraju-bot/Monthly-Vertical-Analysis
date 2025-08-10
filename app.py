@@ -254,3 +254,103 @@ if wide["_period_sort"].notna().any():
     periods_sorted = wide.sort_values(by=["_period_sort", "_row_order"])["Period"].unique().tolist()
 else:
     periods_sorted = wide.sort_values(by="_row_order")["Period
+    periods_sorted = wide.sort_values(by="_row_order")["Period"].unique().tolist()
+
+latest_period = periods_sorted[-1]
+prev_period = periods_sorted[-2] if len(periods_sorted) >= 2 else None
+
+# -----------------------------
+# Summary table: current, delta, zone
+# -----------------------------
+summary_rows = []
+for v in detected_verticals:
+    row = {"Vertical": v}
+    for m in METRICS_IN_ORDER:
+        curr_val = wide.loc[(wide["Period"] == latest_period) & (wide["Vertical"] == v), m]
+        curr_val = curr_val.iloc[0] if not curr_val.empty else np.nan
+
+        prev_val = wide.loc[(wide["Period"] == prev_period) & (wide["Vertical"] == v), m] if prev_period else pd.Series([np.nan])
+        prev_val = prev_val.iloc[0] if not prev_val.empty else np.nan
+
+        delta = curr_val - prev_val if (not pd.isna(curr_val) and not pd.isna(prev_val)) else np.nan
+        zone = zone_of(curr_val, *thresholds[m])
+
+        row[f"{m}"] = curr_val
+        row[f"{m} Δ"] = delta
+        row[f"{m} Zone"] = zone
+    summary_rows.append(row)
+
+summary_df = pd.DataFrame(summary_rows)
+
+# -----------------------------
+# Performance Strength calculation
+# -----------------------------
+# Normalize each metric so higher = better, then average for each vertical
+norm_df = summary_df.copy()
+for m in METRICS_IN_ORDER:
+    vals = norm_df[m]
+    min_v, max_v = np.nanmin(vals), np.nanmax(vals)
+    if min_v == max_v:
+        norm_df[m] = 0
+    else:
+        norm_df[m] = (vals - min_v) / (max_v - min_v)
+summary_df["Performance Strength %"] = norm_df[METRICS_IN_ORDER].mean(axis=1) * 100
+
+# -----------------------------
+# Display in Streamlit
+# -----------------------------
+st.subheader(f"📅 Current Period: {latest_period}")
+st.dataframe(summary_df.style.format({m: "{:.2f}" for m in summary_df.columns if "Δ" not in m and "%" not in m})
+                        .format({c: "{:.2f}%" for c in summary_df.columns if "%" in c}))
+
+if include_strength_bar:
+    fig, ax = plt.subplots()
+    summary_df.plot(x="Vertical", y="Performance Strength %", kind="bar", ax=ax, color="skyblue")
+    ax.set_ylabel("Performance Strength (%)")
+    ax.set_title("Performance Strength by Vertical")
+    st.pyplot(fig)
+
+# -----------------------------
+# Trends for each metric
+# -----------------------------
+st.subheader("📈 Trends by Metric")
+for m in METRICS_IN_ORDER:
+    fig = metric_trend_figure(m, tidy, detected_verticals)
+    if fig:
+        st.pyplot(fig)
+
+# -----------------------------
+# Export consolidated report
+# -----------------------------
+st.subheader("📄 Download Full Report")
+
+# Build HTML report
+html_parts = [f"<h1>Vertical Health Report</h1><h3>{datetime.now().strftime('%Y-%m-%d')}</h3>"]
+html_parts.append(summary_df.to_html(index=False))
+
+for m in METRICS_IN_ORDER:
+    fig = metric_trend_figure(m, tidy, detected_verticals)
+    if fig:
+        img_b = fig_to_png_bytes(fig)
+        img_b64 = base64.b64encode(img_b).decode()
+        html_parts.append(f"<h3>{m} — Trend</h3><img src='data:image/png;base64,{img_b64}'>")
+
+html_report = "\n".join(html_parts)
+
+st.download_button(
+    label="⬇ Download HTML Report",
+    data=html_report,
+    file_name="vertical_health_report.html",
+    mime="text/html"
+)
+
+# Optional PDF export
+if REPORTLAB_AVAILABLE:
+    pdf_buf = io.BytesIO()
+    doc = SimpleDocTemplate(pdf_buf, pagesize=landscape(A4))
+    styles = getSampleStyleSheet()
+    elems = []
+
+    elems.append(Paragraph("Vertical Health Report", styles['Title']))
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph(f"Generated on:
