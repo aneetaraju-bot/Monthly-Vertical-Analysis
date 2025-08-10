@@ -1,4 +1,6 @@
 streamlit
 pandas
+numpy
 matplotlib
-reportlab
+openpyxl
+reportlab   # optional: only needed for PDF export
