@@ -1,17 +1,13 @@
-# Vertical Performance Analysis
+# Vertical Analysis & Zone Report (Streamlit)
+Upload a CSV/Excel, map columns, set thresholds, and get:
+- Summary table per vertical (latest period + deltas + zone tags)
+- Trend charts per metric
+- Drilldown views
+- Exportable insights CSV
 
-## Overview
-This project calculates **Vertical Performance Health** based on:
-- NPS %
-- Course Completion %
-- Placement Count
+## Run locally
+pip install -r requirements.txt
+streamlit run app.py
 
-Additional metrics:
-- Registration to Placement %
-- Average Mentor Rating
-
-## Steps to Run
-1. Clone repository:
-   ```bash
-   git clone https://github.com/<your-username>/vertical_performance_analysis.git
-   cd vertical_performance_analysis
+## Deploy
+Use Streamlit Community Cloud → New app → Select this repo.
